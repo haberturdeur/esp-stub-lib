@@ -1,0 +1,169 @@
+---
+name: Build OpenOCD Stub
+
+on:
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      openocd_ref:
+        description: openocd-esp32 branch, tag or commit to build against
+        required: false
+        default: master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  OPENOCD_REF: ${{ inputs.openocd_ref || 'master' }}
+  STUB_DIR: openocd/contrib/loaders/flash/espressif
+
+jobs:
+  resolve:
+    name: Resolve OpenOCD commit
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - name: Resolve ${{ env.OPENOCD_REF }}
+        id: resolve
+        run: |
+          ref="$OPENOCD_REF"
+          if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+            sha="$ref"
+          else
+            sha=$(git ls-remote https://github.com/espressif/openocd-esp32.git "$ref" "$ref^{}" | awk -v r="$ref" '
+              $2 == ("refs/heads/" r) { head = $1 }
+              $2 == ("refs/tags/" r "^{}") { peeled = $1 }
+              $2 == ("refs/tags/" r) { tag = $1 }
+              END { print head ? head : (peeled ? peeled : tag) }')
+          fi
+          if [ -z "$sha" ]; then
+            echo "::error::Cannot resolve openocd-esp32 ref '$ref'. Use a branch, a tag or a full commit SHA."
+            exit 1
+          fi
+          echo "openocd-esp32 $ref is $sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.side }})
+    needs: resolve
+    runs-on: ubuntu-latest
+    container: espressif/idf:latest
+    continue-on-error: ${{ matrix.side == 'base' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [head, base]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout openocd-esp32
+        uses: actions/checkout@v4
+        with:
+          repository: espressif/openocd-esp32
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: openocd
+          submodules: false
+
+      - name: Checkout esp-stub-lib
+        uses: actions/checkout@v4
+        with:
+          path: ${{ env.STUB_DIR }}/esp-stub-lib
+          fetch-depth: 0
+
+      - name: Select base commit
+        if: matrix.side == 'base'
+        working-directory: ${{ env.STUB_DIR }}/esp-stub-lib
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          git config --global --add safe.directory '*'
+          if [ "${{ github.event_name }}" = pull_request ]; then
+            base=$(git rev-parse HEAD^1)
+          else
+            base=$(git merge-base HEAD "origin/$DEFAULT_BRANCH")
+          fi
+          git checkout -q --detach "$base"
+
+      - name: Build stubs
+        working-directory: ${{ env.STUB_DIR }}
+        run: |
+          git config --global --add safe.directory '*'
+          git -C ../../../.. rev-parse HEAD > openocd_commit
+          git -C esp-stub-lib rev-parse HEAD > stub_lib_commit
+          . "$IDF_PATH/export.sh" > /dev/null
+          ./build.sh all 2>&1 | tee build.log
+          for dir in build/*/; do
+            if ! compgen -G "${dir}stub_*.elf" > /dev/null; then
+              echo "No stub ELF files found in ${dir}" | tee -a build.log
+              exit 1
+            fi
+          done
+          touch build.ok
+
+      - name: Upload build artifacts
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: stub-${{ matrix.side }}
+          path: |
+            ${{ env.STUB_DIR }}/build/*/stub_*.elf
+            ${{ env.STUB_DIR }}/build/*/stub_*.map
+            ${{ env.STUB_DIR }}/build.log
+            ${{ env.STUB_DIR }}/build.ok
+            ${{ env.STUB_DIR }}/openocd_commit
+            ${{ env.STUB_DIR }}/stub_lib_commit
+          if-no-files-found: warn
+
+  report:
+    name: Size report
+    needs: [resolve, build]
+    if: ${{ !cancelled() && needs.resolve.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout report script
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          sparse-checkout: .github/scripts
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: stub-*
+          path: artifacts
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Generate size report
+        run: |
+          pip install --quiet pyelftools
+          python .github/scripts/stub_size_report.py \
+            --head artifacts/stub-head \
+            --base artifacts/stub-base \
+            --out report.md
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post PR comment
+        if: >-
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          github.event.pull_request.user.login != 'dependabot[bot]'
+        continue-on-error: true
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: stub-size
+          path: report.md
