@@ -28,6 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       sha: ${{ steps.resolve.outputs.sha }}
+      targets: ${{ steps.targets.outputs.targets }}
     steps:
       - name: Resolve ${{ env.OPENOCD_REF }}
         id: resolve
@@ -49,16 +50,35 @@ jobs:
           echo "openocd-esp32 $ref is $sha"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
+      - name: Read stub targets
+        id: targets
+        env:
+          SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          curl -fsSL -o build.sh \
+            "https://raw.githubusercontent.com/espressif/openocd-esp32/$SHA/contrib/loaders/flash/espressif/build.sh"
+          targets=$(python3 -c '
+          import json, re, sys
+          match = re.search(r"^TARGETS=\"([^\"]*)\"", open("build.sh").read(), re.M)
+          targets = match.group(1).replace("\\", " ").split() if match else []
+          print(json.dumps(targets) if targets else "")
+          ')
+          if [ -z "$targets" ]; then
+            echo "::error::Cannot read TARGETS from openocd-esp32 build.sh"
+            exit 1
+          fi
+          echo "Targets: $targets"
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+
   build:
-    name: Build (${{ matrix.side }})
+    name: Build (${{ matrix.target }})
     needs: resolve
     runs-on: ubuntu-latest
     container: espressif/idf:latest
-    continue-on-error: ${{ matrix.side == 'base' }}
     strategy:
       fail-fast: false
       matrix:
-        side: [head, base]
+        target: ${{ fromJSON(needs.resolve.outputs.targets) }}
     defaults:
       run:
         shell: bash
@@ -77,48 +97,57 @@ jobs:
           path: ${{ env.STUB_DIR }}/esp-stub-lib
           fetch-depth: 0
 
-      - name: Select base commit
-        if: matrix.side == 'base'
-        working-directory: ${{ env.STUB_DIR }}/esp-stub-lib
+      - name: Build base and head
+        working-directory: ${{ env.STUB_DIR }}
         env:
+          TARGET: ${{ matrix.target }}
+          EVENT_NAME: ${{ github.event_name }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           git config --global --add safe.directory '*'
-          if [ "${{ github.event_name }}" = pull_request ]; then
-            base=$(git rev-parse HEAD^1)
-          else
-            base=$(git merge-base HEAD "origin/$DEFAULT_BRANCH")
-          fi
-          git checkout -q --detach "$base"
-
-      - name: Build stubs
-        working-directory: ${{ env.STUB_DIR }}
-        run: |
-          git config --global --add safe.directory '*'
-          git -C ../../../.. rev-parse HEAD > openocd_commit
-          git -C esp-stub-lib rev-parse HEAD > stub_lib_commit
           . "$IDF_PATH/export.sh" > /dev/null
-          ./build.sh all 2>&1 | tee build.log
-          for dir in build/*/; do
-            if ! compgen -G "${dir}stub_*.elf" > /dev/null; then
-              echo "No stub ELF files found in ${dir}" | tee -a build.log
-              exit 1
+
+          openocd_commit=$(git -C ../../../.. rev-parse HEAD)
+          head=$(git -C esp-stub-lib rev-parse HEAD)
+          if [ "$EVENT_NAME" = pull_request ]; then
+            base=$(git -C esp-stub-lib rev-parse HEAD^1)
+          else
+            base=$(git -C esp-stub-lib merge-base HEAD "origin/$DEFAULT_BRANCH")
+          fi
+
+          build_side() {
+            local side=$1 commit=$2
+            local out="out/$side"
+            mkdir -p "$out/build/$TARGET" "$out/logs" "$out/status"
+            echo "$openocd_commit" > "$out/openocd_commit"
+            echo "$commit" > "$out/stub_lib_commit"
+            git -C esp-stub-lib checkout -q --detach "$commit"
+            rm -rf "build/$TARGET"
+            echo "::group::Build $TARGET ($side ${commit:0:10})"
+            if ./build.sh "$TARGET" 2>&1 | tee "$out/logs/$TARGET.log" &&
+              compgen -G "build/$TARGET/stub_*.elf" > /dev/null; then
+              cp "build/$TARGET"/stub_*.elf "build/$TARGET"/stub_*.map "$out/build/$TARGET/"
+              touch "$out/status/$TARGET.ok"
             fi
-          done
-          touch build.ok
+            echo "::endgroup::"
+          }
+
+          build_side base "$base"
+          if [ ! -f "out/base/status/$TARGET.ok" ]; then
+            echo "::warning::Base build failed for $TARGET. The report has no baseline for it."
+          fi
+          build_side head "$head"
+          if [ ! -f "out/head/status/$TARGET.ok" ]; then
+            echo "::error::Head build failed for $TARGET"
+            exit 1
+          fi
 
       - name: Upload build artifacts
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
         with:
-          name: stub-${{ matrix.side }}
-          path: |
-            ${{ env.STUB_DIR }}/build/*/stub_*.elf
-            ${{ env.STUB_DIR }}/build/*/stub_*.map
-            ${{ env.STUB_DIR }}/build.log
-            ${{ env.STUB_DIR }}/build.ok
-            ${{ env.STUB_DIR }}/openocd_commit
-            ${{ env.STUB_DIR }}/stub_lib_commit
+          name: stub-${{ matrix.target }}
+          path: ${{ env.STUB_DIR }}/out/
           if-no-files-found: warn
 
   report:
@@ -142,6 +171,7 @@ jobs:
         with:
           pattern: stub-*
           path: artifacts
+          merge-multiple: true
 
       - name: Set up Python
         uses: actions/setup-python@v7
@@ -149,11 +179,14 @@ jobs:
           python-version: '3.12'
 
       - name: Generate size report
+        env:
+          TARGETS: ${{ needs.resolve.outputs.targets }}
         run: |
           pip install --quiet pyelftools
           python .github/scripts/stub_size_report.py \
-            --head artifacts/stub-head \
-            --base artifacts/stub-base \
+            --head artifacts/head \
+            --base artifacts/base \
+            --targets "$TARGETS" \
             --out report.md
           cat report.md >> "$GITHUB_STEP_SUMMARY"
 

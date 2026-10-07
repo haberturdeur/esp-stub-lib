@@ -5,6 +5,7 @@
 """Compare OpenOCD stub ELF sizes of two build artifacts and write a Markdown report."""
 
 import argparse
+import json
 import re
 import sys
 from pathlib import Path
@@ -15,33 +16,34 @@ from elftools.elf.sections import SymbolTableSection
 SECTIONS = ('.text', '.data', '.bss')
 ELF_NAME_RE = re.compile(r'^stub_[a-z0-9]+_(?P<command>.+)\.elf$')
 LOG_TAIL_LINES = 50
+MAX_FAILED_LOGS = 3
 
 
 class Build:
-    def __init__(self, root):
+    def __init__(self, root, targets):
         self.root = Path(root)
         self.exists = self.root.is_dir()
-        self.finished = self.exists and (self.root / 'build.ok').is_file()
         self.openocd_commit = self._read('openocd_commit')
         self.stub_lib_commit = self._read('stub_lib_commit')
-        self.sizes = self._collect() if self.finished else {}
-        self.ok = self.finished and bool(self.sizes)
+        self.ok_targets = [t for t in targets if (self.root / 'status' / f'{t}.ok').is_file()]
+        self.failed_targets = [t for t in targets if t not in self.ok_targets]
+        self.sizes = self._collect(self.ok_targets)
 
     def _read(self, name):
         path = self.root / name
         return path.read_text().strip() if path.is_file() else None
 
-    def _collect(self):
+    def _collect(self, targets):
         sizes = {}
-        for elf_path in sorted(self.root.glob('build/*/stub_*.elf')):
-            match = ELF_NAME_RE.match(elf_path.name)
-            if not match:
-                continue
-            sizes[(elf_path.parent.name, match.group('command'))] = read_elf(elf_path)
+        for target in targets:
+            for elf_path in sorted((self.root / 'build' / target).glob('stub_*.elf')):
+                match = ELF_NAME_RE.match(elf_path.name)
+                if match:
+                    sizes[(target, match.group('command'))] = read_elf(elf_path)
         return sizes
 
-    def log_tail(self):
-        log = self.root / 'build.log'
+    def log_tail(self, target):
+        log = self.root / 'logs' / f'{target}.log'
         if not log.is_file():
             return None
         return '\n'.join(log.read_text(errors='replace').splitlines()[-LOG_TAIL_LINES:])
@@ -117,50 +119,51 @@ def details(summary, body):
     return f'<details>\n<summary>{summary}</summary>\n\n{body}\n\n</details>'
 
 
-def build_report(head, base):
+def finish(lines):
+    return '\n'.join(lines) + '\n'
+
+
+def build_report(head, base, targets):
     lines = ['## OpenOCD stub size report', '']
-    openocd_mismatch = base.ok and head.openocd_commit != base.openocd_commit
-    if openocd_mismatch:
-        openocd = f'base {short(base.openocd_commit)}, head {short(head.openocd_commit)}'
-    else:
-        openocd = short(head.openocd_commit)
     lines.append(
-        f'openocd-esp32 {openocd}, '
+        f'openocd-esp32 {short(head.openocd_commit or base.openocd_commit)}, '
         f'esp-stub-lib base {short(base.stub_lib_commit)}, head {short(head.stub_lib_commit)}'
     )
     lines.append('')
 
     if not head.exists:
-        lines.append(':x: **No head build artifacts found.** See the `Build (head)` job.')
-        return '\n'.join(lines) + '\n'
+        lines.append(':x: **No head build artifacts found.** See the `Build` jobs.')
+        return finish(lines)
 
-    if head.finished and not head.sizes:
+    if head.failed_targets:
+        failed = ', '.join(head.failed_targets)
+        lines.append(f':x: **Head build failed for {failed}.** See the matching `Build (<target>)` jobs.')
+        for target in head.failed_targets[:MAX_FAILED_LOGS]:
+            tail = head.log_tail(target)
+            if tail:
+                lines += ['', details(f'{target}: last {LOG_TAIL_LINES} lines of the build log', f'```\n{tail}\n```')]
+        return finish(lines)
+
+    if not head.sizes:
         lines.append(':x: **Head build produced no stub ELF files.** Check the build output paths and artifact upload.')
-        return '\n'.join(lines) + '\n'
+        return finish(lines)
 
-    if not head.ok:
-        lines.append(':x: **Head build failed.** See the `Build (head)` job for the full log.')
-        tail = head.log_tail()
-        if tail:
-            lines += ['', details(f'Last {LOG_TAIL_LINES} lines of build.log', f'```\n{tail}\n```')]
-        return '\n'.join(lines) + '\n'
-
-    keys = sorted(head.sizes)
-    if not base.ok or openocd_mismatch:
-        if openocd_mismatch:
-            lines.append(':warning: **No baseline.** The base and head builds used different openocd-esp32 commits.')
-        else:
-            lines.append(':warning: **No baseline.** The base build failed or produced no artifacts.')
+    compared = set(base.ok_targets)
+    if not compared:
+        keys = sorted(head.sizes)
+        lines.append(':warning: **No baseline.** The base build failed or produced no artifacts.')
         lines += ['', details('Head sizes', table([row(k, head.sizes[k], None, has_baseline=False) for k in keys]))]
-        return '\n'.join(lines) + '\n'
+        return finish(lines)
 
-    all_keys = sorted(set(head.sizes) | set(base.sizes))
+    all_keys = sorted(set(head.sizes) | {k for k in base.sizes if k[0] in compared})
     changed = []
     grown = []
     shrunk = 0
     added = 0
     removed = 0
     for key in all_keys:
+        if key[0] not in compared:
+            continue
         h = head.sizes.get(key)
         b = base.sizes.get(key)
         if h is not None and b is not None and all(h[n] == b[n] for n in SECTIONS):
@@ -194,21 +197,29 @@ def build_report(head, base):
         if not parts:
             parts.append('Section sizes changed with no change in total')
         lines.append(':bar_chart: ' + '. '.join(parts) + '.')
+
+    no_baseline = [t for t in targets if t not in compared]
+    if no_baseline:
+        lines += ['', f':warning: No baseline for {", ".join(no_baseline)}. The base build failed for these targets.']
+
+    if changed:
         lines += ['', table(changed)]
 
-    full = table([row(k, head.sizes.get(k), base.sizes.get(k)) for k in all_keys])
+    full = table([row(k, head.sizes.get(k), base.sizes.get(k), has_baseline=k[0] in compared) for k in all_keys])
     lines += ['', details('All stubs', full)]
-    return '\n'.join(lines) + '\n'
+    return finish(lines)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--head', required=True, help='Head build artifact directory')
     parser.add_argument('--base', required=True, help='Base build artifact directory')
+    parser.add_argument('--targets', required=True, help='JSON list of expected build targets')
     parser.add_argument('--out', required=True, help='Output Markdown file')
     args = parser.parse_args()
 
-    report = build_report(Build(args.head), Build(args.base))
+    targets = json.loads(args.targets)
+    report = build_report(Build(args.head, targets), Build(args.base, targets), targets)
     Path(args.out).write_text(report)
     sys.stdout.write(report)
 
