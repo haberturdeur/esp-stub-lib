@@ -74,7 +74,7 @@ jobs:
     name: Build (${{ matrix.target }})
     needs: resolve
     runs-on: ubuntu-latest
-    container: espressif/idf:latest
+    container: espressif/idf:v6.1
     strategy:
       fail-fast: false
       matrix:
@@ -90,12 +90,14 @@ jobs:
           ref: ${{ needs.resolve.outputs.sha }}
           path: openocd
           submodules: false
+          persist-credentials: false
 
       - name: Checkout esp-stub-lib
         uses: actions/checkout@v7
         with:
           path: ${{ env.STUB_DIR }}/esp-stub-lib
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Build base and head
         working-directory: ${{ env.STUB_DIR }}
@@ -155,15 +157,13 @@ jobs:
     needs: [resolve, build]
     if: ${{ !cancelled() && needs.resolve.result == 'success' }}
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
     steps:
       - name: Checkout report script
         uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           sparse-checkout: .github/scripts
+          persist-credentials: false
 
       - name: Download build artifacts
         uses: actions/download-artifact@v8
@@ -182,7 +182,7 @@ jobs:
         env:
           TARGETS: ${{ needs.resolve.outputs.targets }}
         run: |
-          pip install --quiet pyelftools
+          pip install --quiet pyelftools==0.33
           python .github/scripts/stub_size_report.py \
             --head artifacts/head \
             --base artifacts/base \
@@ -190,13 +190,32 @@ jobs:
             --out report.md
           cat report.md >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Upload size report
+        uses: actions/upload-artifact@v7
+        with:
+          name: size-report
+          path: report.md
+
+  comment:
+    name: Post size report
+    needs: report
+    if: >-
+      !cancelled() && needs.report.result == 'success' &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write  # Sticky size comment. This job runs no PR code.
+    steps:
+      - name: Download size report
+        uses: actions/download-artifact@v8
+        with:
+          name: size-report
+
       - name: Post PR comment
-        if: >-
-          github.event_name == 'pull_request' &&
-          github.event.pull_request.head.repo.full_name == github.repository &&
-          github.event.pull_request.user.login != 'dependabot[bot]'
         continue-on-error: true
-        uses: marocchino/sticky-pull-request-comment@v3
+        uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88  # v3.0.5
         with:
           header: stub-size
           path: report.md
