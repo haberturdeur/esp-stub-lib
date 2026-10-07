@@ -64,7 +64,7 @@ jobs:
         shell: bash
     steps:
       - name: Checkout openocd-esp32
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: espressif/openocd-esp32
           ref: ${{ needs.resolve.outputs.sha }}
@@ -72,7 +72,7 @@ jobs:
           submodules: false
 
       - name: Checkout esp-stub-lib
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: ${{ env.STUB_DIR }}/esp-stub-lib
           fetch-depth: 0
@@ -109,7 +109,7 @@ jobs:
 
       - name: Upload build artifacts
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: stub-${{ matrix.side }}
           path: |
@@ -131,20 +131,20 @@ jobs:
       pull-requests: write
     steps:
       - name: Checkout report script
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           sparse-checkout: .github/scripts
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           pattern: stub-*
           path: artifacts
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
@@ -163,7 +163,7 @@ jobs:
           github.event.pull_request.head.repo.full_name == github.repository &&
           github.event.pull_request.user.login != 'dependabot[bot]'
         continue-on-error: true
-        uses: marocchino/sticky-pull-request-comment@v2
+        uses: marocchino/sticky-pull-request-comment@v3
         with:
           header: stub-size
           path: report.md
